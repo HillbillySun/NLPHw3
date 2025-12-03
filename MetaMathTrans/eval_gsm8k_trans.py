@@ -214,7 +214,7 @@ def gsm8k_test(model_name, data_path, start=0, end=MAX_INT, batch_size=1, tensor
             result.append(False)
             temp = {'question': prompt, 'output': completion, 'answer': prompt_answer}
             invalid_outputs.append(temp)
-    acc = sum(result) / len(result)
+    acc = sum(result) / (len(result) - len(invalid_outputs))
     print('len invalid outputs ====', len(invalid_outputs), ', valid_outputs===', invalid_outputs)
     print('start===', start, ', end====', end)
     print('gsm8k length====', len(result), ', gsm8k acc====', acc)
