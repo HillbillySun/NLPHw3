@@ -224,7 +224,7 @@ def test_hendrycks_math(model, data_path, start=0, end=MAX_INT, batch_size=1, te
     hf_model = AutoModelForCausalLM.from_pretrained(
         model,
         trust_remote_code=True,
-        dtype=dtype,
+        torch_dtype=dtype,
     )
     hf_model.to(device)
     hf_model.eval()
