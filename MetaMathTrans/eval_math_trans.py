@@ -58,7 +58,7 @@ def process_results(doc, completion, answer):
         invalid_outputs.append(
             {"question": doc, "output": completion, "answer": answer}
         )
-    # print("PRED:", pred_expr, "GOLD:", gold_expr)
+    print("PRED:", pred_expr, "GOLD:", gold_expr)
 
     return res
 

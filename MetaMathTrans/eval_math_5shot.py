@@ -18,7 +18,6 @@ def get_device():
         return "mps"
     return "cpu"
 
-# 全局收集错误样本
 invalid_outputs = []
 
 def remove_boxed(s):
@@ -33,10 +32,10 @@ def remove_boxed(s):
 
 def extract_answer_expr(completion: str):
     """
-    从模型输出中提取答案表达式，优先级：
-    1) 从“真正的” The answer is: <expr> 行里抽（跳过模板里的 <expression>）
-    2) 回退到最后一个 \\boxed{...}
-    3) 再不行，用最后一行非空内容兜底，并去掉常见前缀。
+    从模型输出中提取答案表达式（预测用），优先级：
+    1) 真实答案行: The answer is: <expr>（跳过模板里的 <expression>）
+    2) 最后一个 \\boxed{...}
+    3) 最后一行非空内容兜底，并去掉常见前缀。
     """
     lines = completion.splitlines()
 
@@ -88,6 +87,42 @@ def extract_answer_expr(completion: str):
     return expr or None
 
 
+def extract_gold_expr_from_solution(solution: str):
+    """
+    从 train/test 的标准解答文本中抽金答案表达式，优先级：
+    1) The answer is: <expr>
+    2) 最后一个 \\boxed{...}
+    抽不到就返回 None。
+    """
+    if solution is None:
+        return None
+
+    # 1) 先找 "The answer is: ..."
+    m = re.search(r"[Tt]he answer is[:：]?\s*(.*)", solution)
+    if m:
+        expr = m.group(1).strip()
+        expr = expr.split("\n")[0].strip()
+        expr = expr.rstrip(".!；;")
+        expr = remove_boxed(expr)
+        if expr:
+            return expr
+
+    # 2) 退到 \boxed{...}
+    try:
+        boxed = util.last_boxed_only_string(solution)
+    except Exception:
+        boxed = None
+
+    if boxed is not None:
+        expr = remove_boxed(boxed)
+        if expr is not None:
+            expr = expr.strip().rstrip(".!；;")
+            if expr:
+                return expr
+
+    return None
+
+
 def process_results(doc, completion, gold_expr):
     """
     对单个样本做评测：
@@ -102,6 +137,7 @@ def process_results(doc, completion, gold_expr):
         invalid_outputs.append(
             {"question": doc, "output": completion, "answer": gold_expr}
         )
+        print("PRED: None", "GOLD:", gold_expr)
         return False
 
     # 万一模型自己又包了个 \boxed{}，这里再去一层
@@ -111,6 +147,7 @@ def process_results(doc, completion, gold_expr):
         invalid_outputs.append(
             {"question": doc, "output": completion, "answer": gold_expr}
         )
+        print("PRED:", pred_expr, "GOLD:", gold_expr)
         return False
 
     res = util.is_equiv(pred_expr, gold_expr)
@@ -119,22 +156,8 @@ def process_results(doc, completion, gold_expr):
         invalid_outputs.append(
             {"question": doc, "output": completion, "answer": gold_expr}
         )
-
+    print("PRED:", pred_expr, "GOLD:", gold_expr)
     return res
-
-
-def batch_data(data_list, batch_size=1):
-    n = len(data_list) // batch_size
-    batch_data = []
-    for i in range(n - 1):
-        start = i * batch_size
-        end = (i + 1) * batch_size
-        batch_data.append(data_list[start:end])
-
-    last_start = (n - 1) * batch_size
-    last_end = MAX_INT
-    batch_data.append(data_list[last_start:last_end])
-    return batch_data
 
 
 def test_hendrycks_math(model, data_path, train_path,
@@ -142,43 +165,105 @@ def test_hendrycks_math(model, data_path, train_path,
                         tensor_parallel_size=1):
     """
     MATH 5-shot 评测：
-    - train_path: few-shot 示例来源（例如 MATH_train.jsonl）
-    - data_path : 评测集（例如 MATH_test.jsonl）
-      均假定每行有字段：instruction / output
+    - train_path: few-shot 示例来源（json 或 jsonl，都支持 MetaMathQA-1k.json）
+    - data_path : 评测集（比如 MATH_test.jsonl）
+      样本中尽量有：instruction/output 或 query/response 等字段。
     """
     global invalid_outputs
     invalid_outputs = []
 
     # ---------- 1. 读取 train_file，构造 few-shot 示例 ----------
     with open(train_path, "r", encoding="utf8") as f:
-        train_items = list(jsonlines.Reader(f))
+        if train_path.endswith(".jsonl"):
+            train_items = list(jsonlines.Reader(f))
+        else:
+            raw = json.load(f)
+            if isinstance(raw, list):
+                train_items = raw
+            elif isinstance(raw, dict):
+                # 常见结构：{"train": [...]} / {"data": [...]}
+                if isinstance(raw.get("train"), list):
+                    train_items = raw["train"]
+                elif isinstance(raw.get("data"), list):
+                    train_items = raw["data"]
+                else:
+                    train_items = None
+                    for v in raw.values():
+                        if isinstance(v, list):
+                            train_items = v
+                            break
+                    if train_items is None:
+                        raise ValueError("无法从 train_file json 中解析出样本列表，请检查文件结构。")
+            else:
+                raise ValueError("train_file 既不是 list 也不是 dict，请检查格式。")
+
+    # 尝试只保留 MATH 类型（针对 MetaMathQA 这类）
+    filtered_items = []
+    for it in train_items:
+        t = str(it.get("type", "")).upper()
+        if "MATH" in t:
+            filtered_items.append(it)
+
+    if filtered_items:
+        train_items = filtered_items
+        print(f"[info] 只使用 type 含 'MATH' 的 train 样本，数量 = {len(train_items)}")
+    else:
+        print("[warn] train_file 中没有带 'MATH' 类型字段，使用全部样本做 few-shot。")
 
     train_total = len(train_items)
     print("train total length ===", train_total)
 
     K = min(5, train_total)
     if K == 0:
-        print("Empty train_file:", train_path)
+        print("Empty train_file after filtering:", train_path)
         return
 
-    fewshot_items = train_items[:K]  # 也可以改成随机采样
+    fewshot_items = train_items[:K]  # 你也可以改成 random.sample(train_items, K)
+
+    def get_train_instruction(it):
+        return (
+            it.get("instruction")
+            or it.get("query")
+            or it.get("problem")
+            or it.get("question")
+        )
+
+    def get_train_output(it):
+        return (
+            it.get("output")
+            or it.get("response")
+            or it.get("solution")
+        )
 
     # few-shot 示例块
     fewshot_blocks = []
     for i, item in enumerate(fewshot_items, 1):
-        q = item["instruction"]
-        solution = item["output"]
+        q = get_train_instruction(item)
+        solution = get_train_output(item)
 
-        # gold 答案：最后一个 \boxed{...} 去壳
-        boxed = util.last_boxed_only_string(solution)
-        ans_expr = remove_boxed(boxed)
+        if q is None or solution is None:
+            # 跳过格式不完整的样本
+            continue
 
-        block = (
-            f"### Example {i} Problem:\n{q}\n\n"
-            f"### Example {i} Solution:\n{solution}\n"
-            f"The answer is: {ans_expr}\n\n"
-        )
+        # 从标准解答里抽 gold expr
+        ans_expr = extract_gold_expr_from_solution(solution)
+
+        if ans_expr is None:
+            # 没抽到答案，就只给原始解答，不额外加 'The answer is: None'
+            block = (
+                f"### Example {i} Problem:\n{q}\n\n"
+                f"### Example {i} Solution:\n{solution}\n\n"
+            )
+        else:
+            block = (
+                f"### Example {i} Problem:\n{q}\n\n"
+                f"### Example {i} Solution:\n{solution}\n"
+                f"The answer is: {ans_expr}\n\n"
+            )
         fewshot_blocks.append(block)
+
+    if not fewshot_blocks:
+        raise ValueError("few-shot 样本都不合法（instruction/output 缺失），请检查 train_file。")
 
     # few-shot 前缀
     fewshot_prefix = (
@@ -197,24 +282,61 @@ def test_hendrycks_math(model, data_path, train_path,
     )
     print("single problem template =====", problem_prompt)
 
-    # ---------- 2. 读取 test_file，构造真正的评测输入 ----------
+    # ---------- 2. 读取 test_file（data_path），构造真正的评测输入 ----------
     hendrycks_math_ins = []
     hendrycks_math_answers = []
 
     with open(data_path, "r", encoding="utf8") as f:
-        all_items = list(jsonlines.Reader(f))
+        if data_path.endswith(".jsonl"):
+            all_items = list(jsonlines.Reader(f))
+        else:
+            raw = json.load(f)
+            if isinstance(raw, list):
+                all_items = raw
+            elif isinstance(raw, dict):
+                if isinstance(raw.get("data"), list):
+                    all_items = raw["data"]
+                else:
+                    all_items = None
+                    for v in raw.values():
+                        if isinstance(v, list):
+                            all_items = v
+                            break
+                    if all_items is None:
+                        raise ValueError("无法从 data_file json 中解析出样本列表，请检查文件结构。")
+            else:
+                raise ValueError("data_file 既不是 list 也不是 dict，请检查格式。")
 
-    total_len = len(all_items)
-    print("test total length ===", total_len)
+    print("test total length ===", len(all_items))
+
+    def get_test_instruction(it):
+        return (
+            it.get("instruction")
+            or it.get("query")
+            or it.get("problem")
+            or it.get("question")
+        )
+
+    def get_test_output(it):
+        return (
+            it.get("output")
+            or it.get("response")
+            or it.get("solution")
+        )
 
     for item in all_items:
-        instr = item["instruction"]
+        instr = get_test_instruction(item)
+        solution = get_test_output(item)
+        if instr is None or solution is None:
+            continue
+
+        gold_expr = extract_gold_expr_from_solution(solution)
+        if gold_expr is None:
+            # gold 抽不到答案，没法评测，直接跳过
+            continue
+
         full_prompt = fewshot_prefix + problem_prompt.format(instruction=instr)
         hendrycks_math_ins.append(full_prompt)
-
-        solution = item["output"]
-        boxed = util.last_boxed_only_string(solution)
-        gold_expr = remove_boxed(boxed)
         hendrycks_math_answers.append(gold_expr)
 
     # 应用 start / end 截取
@@ -239,7 +361,7 @@ def test_hendrycks_math(model, data_path, train_path,
     hf_model = AutoModelForCausalLM.from_pretrained(
         model,
         trust_remote_code=True,
-        torch_dtype=dtype,  # 注意：这里必须用 torch_dtype，不能用 dtype
+        torch_dtype=dtype,  # 目前用 torch_dtype，避免部分模型报错
     )
     hf_model.to(device)
     hf_model.eval()
@@ -266,7 +388,7 @@ def test_hendrycks_math(model, data_path, train_path,
             outputs = hf_model.generate(
                 **inputs,
                 max_new_tokens=512,
-                do_sample=False,
+                do_sample=False,               # 需要可以改 True + 设置 temperature/top_p
                 pad_token_id=tokenizer.pad_token_id,
             )
 
@@ -284,16 +406,19 @@ def test_hendrycks_math(model, data_path, train_path,
         results.append(res)
 
     acc = sum(results) / len(results) if results else 0.0
-    print("len invalid outputs ====", len(invalid_outputs), ", invalid_outputs ===", invalid_outputs)
+    print("len invalid outputs ====", len(invalid_outputs),
+          ", invalid_outputs ===", invalid_outputs)
     print("length====", len(results), ", acc====", acc)
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default='')   # HF 模型名或本地路径
-    parser.add_argument("--data_file", type=str, default='')   # 测试集
-    parser.add_argument("--train_file", type=str, required=True,  # 训练集 / few-shot 源
-                        help="MATH 训练集 jsonl，用作 few-shot 示例")
+    parser.add_argument("--model", type=str, default='',
+                        help="HF 模型名或本地路径，建议用 *-Instruct 模型")
+    parser.add_argument("--data_file", type=str, default='',
+                        help="测试集（例如 MATH_test.jsonl）")
+    parser.add_argument("--train_file", type=str, required=True,
+                        help="MATH 训练集 / few-shot 源（json 或 jsonl，支持 MetaMathQA-1k.json）")
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int, default=MAX_INT)
     parser.add_argument("--batch_size", type=int, default=16)
