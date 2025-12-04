@@ -1,14 +1,13 @@
 import argparse
 import json
-import pdb
 import jsonlines
 import re
 import util
-# from vllm import LLM, SamplingParams
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm.auto import tqdm
 import sys
+
 MAX_INT = sys.maxsize
 INVALID_ANS = "[invalid]"
 
@@ -19,35 +18,106 @@ def get_device():
         return "mps"
     return "cpu"
 
+# 全局收集错误样本
 invalid_outputs = []
+
 def remove_boxed(s):
+    """只在确实是 \\boxed{...} 时去壳，否则原样返回。"""
+    if s is None:
+        return None
+    s = s.strip()
     left = "\\boxed{"
-    try:
-        assert s[:len(left)] == left
-        assert s[-1] == "}"
+    if s.startswith(left) and s.endswith("}"):
         return s[len(left):-1]
-    except:
+    return s
+
+def extract_answer_expr(completion: str):
+    """
+    从模型输出中提取答案表达式，优先级：
+    1) 从“真正的” The answer is: <expr> 行里抽（跳过模板里的 <expression>）
+    2) 回退到最后一个 \\boxed{...}
+    3) 再不行，用最后一行非空内容兜底，并去掉常见前缀。
+    """
+    lines = completion.splitlines()
+
+    # 1) 从末尾往前找含 "The answer is" 的行，跳过模板那种
+    for line in reversed(lines):
+        m = re.search(r"[Tt]he answer is[:：]?\s*(.*)", line)
+        if not m:
+            continue
+
+        expr = m.group(1).strip()
+        # 跳过模板里的占位：<expression> / 空行 / 包含 <> 等
+        if (
+            not expr
+            or "<" in expr or ">" in expr
+            or "expression" in expr.lower()
+        ):
+            continue
+
+        expr = expr.rstrip(".!；;")
+        if expr:
+            return expr
+
+    # 2) 退而求其次：找最后一个 \\boxed{...}
+    try:
+        boxed = util.last_boxed_only_string(completion)
+    except Exception:
+        boxed = None
+
+    if boxed is not None:
+        expr = remove_boxed(boxed)
+        if expr is not None:
+            expr = expr.strip().rstrip(".!；;")
+            if expr:
+                return expr
+
+    # 3) 再兜底：取最后一行非空内容，并去掉常见前缀
+    non_empty = [l.strip() for l in lines if l.strip()]
+    if not non_empty:
         return None
 
-def process_results(doc, completion, answer):
-    # 1. 先用新函数抽预测表达式
+    expr = non_empty[-1]
+    expr = re.sub(
+        r"^(Answer|So|Thus|Therefore|Final answer|The final answer is)[:：]?\s*",
+        "",
+        expr,
+        flags=re.IGNORECASE,
+    )
+    expr = expr.rstrip(".!；;")
+    return expr or None
+
+
+def process_results(doc, completion, gold_expr):
+    """
+    对单个样本做评测：
+    - 从 completion 中抽预测表达式
+    - 与 gold_expr 用 util.is_equiv 判等价
+    - 记录错误样本到 invalid_outputs
+    """
+    global invalid_outputs
+
     pred_expr = extract_answer_expr(completion)
     if pred_expr is None:
         invalid_outputs.append(
-            {"question": doc, "output": completion, "answer": answer}
+            {"question": doc, "output": completion, "answer": gold_expr}
         )
         return False
 
-    # 2. 去掉 boxed 符号，和官方 eval 保持一致
+    # 万一模型自己又包了个 \boxed{}，这里再去一层
     pred_expr = remove_boxed(pred_expr)
-    gold_expr = remove_boxed(answer)
 
-    # 3. 用 util.is_equiv 做等价判断
+    if pred_expr is None or gold_expr is None:
+        invalid_outputs.append(
+            {"question": doc, "output": completion, "answer": gold_expr}
+        )
+        return False
+
     res = util.is_equiv(pred_expr, gold_expr)
 
     if not res:
         invalid_outputs.append(
-            {"question": doc, "output": completion, "answer": answer}
+            {"question": doc, "output": completion, "answer": gold_expr}
         )
 
     return res
@@ -56,77 +126,52 @@ def process_results(doc, completion, answer):
 def batch_data(data_list, batch_size=1):
     n = len(data_list) // batch_size
     batch_data = []
-    for i in range(n-1):
+    for i in range(n - 1):
         start = i * batch_size
-        end = (i+1)*batch_size
+        end = (i + 1) * batch_size
         batch_data.append(data_list[start:end])
 
-    last_start = (n-1) * batch_size
+    last_start = (n - 1) * batch_size
     last_end = MAX_INT
     batch_data.append(data_list[last_start:last_end])
     return batch_data
 
-def extract_answer_expr(completion: str):
+
+def test_hendrycks_math(model, data_path, train_path,
+                        start=0, end=MAX_INT, batch_size=1,
+                        tensor_parallel_size=1):
     """
-    从模型输出中提取 'The answer is: ...' 后面的表达式。
-    没有这句时，退而求其次用最后一行非空文本。
+    MATH 5-shot 评测：
+    - train_path: few-shot 示例来源（例如 MATH_train.jsonl）
+    - data_path : 评测集（例如 MATH_test.jsonl）
+      均假定每行有字段：instruction / output
     """
-    # 1. 先尽量找 'The answer is'
-    m = re.search(r"[Tt]he answer is[:：]?\s*(.*)", completion)
-    if m:
-        expr = m.group(1).strip()
-        # 只取这一行，防止后面还有别的话
-        expr = expr.split("\n")[0].strip()
-    else:
-        # 2. 兜底：没有标记行，就拿最后一行非空内容
-        lines = [l.strip() for l in completion.splitlines() if l.strip()]
-        if not lines:
-            return None
-        expr = lines[-1]
+    global invalid_outputs
+    invalid_outputs = []
 
-    # 去掉结尾的句号/感叹号之类
-    expr = expr.rstrip(".!；;")
-    return expr
+    # ---------- 1. 读取 train_file，构造 few-shot 示例 ----------
+    with open(train_path, "r", encoding="utf8") as f:
+        train_items = list(jsonlines.Reader(f))
 
+    train_total = len(train_items)
+    print("train total length ===", train_total)
 
-def test_hendrycks_math(model, data_path, start=0, end=MAX_INT, batch_size=1, tensor_parallel_size=1):
-    hendrycks_math_ins = []
-    hendrycks_math_answers = []
-
-    # 用前 K 条样本做 few-shot 示例
-    with open(data_path, "r", encoding="utf8") as f:
-        all_items = list(jsonlines.Reader(f))
-
-    total_len = len(all_items)
-    print("total length ===", total_len)
-
-    # 防止样本太少的情况
-    K = min(5, total_len)
+    K = min(5, train_total)
     if K == 0:
-        print("No data in", data_path)
+        print("Empty train_file:", train_path)
         return
 
-    fewshot_items = all_items[:K]
-    eval_items = all_items[K:]  # 这些才参与评测
+    fewshot_items = train_items[:K]  # 也可以改成随机采样
 
-    # 单题模板（只描述当前要解的题）
-    problem_prompt = (
-        "### Problem:\n{instruction}\n\n"
-        "### Solution:\nLet's think step by step."
-    )
-    print("problem template =====", problem_prompt)
-
-    # -------- 1. 构造 few-shot 前缀（用 instruction / output 字段） --------
+    # few-shot 示例块
     fewshot_blocks = []
     for i, item in enumerate(fewshot_items, 1):
-        # 题目在 instruction 字段
         q = item["instruction"]
-        # 解答在 output 字段，里面包含 \boxed{...}
         solution = item["output"]
 
-        # 从 gold solution 里抽出 \boxed{...} 里的表达式当答案
-        # util.last_boxed_only_string 是你仓库里原来的工具函数
-        ans_expr = remove_boxed(util.last_boxed_only_string(solution))
+        # gold 答案：最后一个 \boxed{...} 去壳
+        boxed = util.last_boxed_only_string(solution)
+        ans_expr = remove_boxed(boxed)
 
         block = (
             f"### Example {i} Problem:\n{q}\n\n"
@@ -135,35 +180,53 @@ def test_hendrycks_math(model, data_path, start=0, end=MAX_INT, batch_size=1, te
         )
         fewshot_blocks.append(block)
 
+    # few-shot 前缀
     fewshot_prefix = (
         "You are a helpful competition math assistant.\n"
         "Below are some examples of solving competition math problems.\n"
-        "For each problem, think step by step. Then on the last line, write "
-        "'The answer is: <expression>'.\n\n"
+        "For each problem, reason step by step and on the last line output:\n"
+        "The answer is: <expression>\n\n"
         + "".join(fewshot_blocks)
         + "Now solve the following problem.\n\n"
     )
 
-    # -------- 2. 为真正评测的题目构造输入 & gold 答案 --------
-    for item in eval_items:
-        # 这里用 instruction，不是 query
-        temp_instr = fewshot_prefix + problem_prompt.format(
-            instruction=item["instruction"]
-        )
-        hendrycks_math_ins.append(temp_instr)
+    # 单题模板
+    problem_prompt = (
+        "### Problem:\n{instruction}\n\n"
+        "### Solution:\nLet's think step by step."
+    )
+    print("single problem template =====", problem_prompt)
+
+    # ---------- 2. 读取 test_file，构造真正的评测输入 ----------
+    hendrycks_math_ins = []
+    hendrycks_math_answers = []
+
+    with open(data_path, "r", encoding="utf8") as f:
+        all_items = list(jsonlines.Reader(f))
+
+    total_len = len(all_items)
+    print("test total length ===", total_len)
+
+    for item in all_items:
+        instr = item["instruction"]
+        full_prompt = fewshot_prefix + problem_prompt.format(instruction=instr)
+        hendrycks_math_ins.append(full_prompt)
 
         solution = item["output"]
-        gold_expr = remove_boxed(util.last_boxed_only_string(solution))
+        boxed = util.last_boxed_only_string(solution)
+        gold_expr = remove_boxed(boxed)
         hendrycks_math_answers.append(gold_expr)
 
-    print("eval total length ===", len(hendrycks_math_ins))
-
-    # start / end 索引用在 eval 集上
+    # 应用 start / end 截取
     hendrycks_math_ins = hendrycks_math_ins[start:end]
     hendrycks_math_answers = hendrycks_math_answers[start:end]
-    print("sliced length ====", len(hendrycks_math_ins))
+    print("eval sliced length ====", len(hendrycks_math_ins))
 
-    # -------- 3. 初始化 HF 模型（保持你原来的代码逻辑） --------
+    if not hendrycks_math_ins:
+        print("Nothing to evaluate after slicing.")
+        return
+
+    # ---------- 3. 初始化 HF 模型 ----------
     device = get_device()
     print("Using device:", device)
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
@@ -176,13 +239,13 @@ def test_hendrycks_math(model, data_path, start=0, end=MAX_INT, batch_size=1, te
     hf_model = AutoModelForCausalLM.from_pretrained(
         model,
         trust_remote_code=True,
-        dtype=dtype,
+        torch_dtype=dtype,  # 注意：这里必须用 torch_dtype，不能用 dtype
     )
     hf_model.to(device)
     hf_model.eval()
 
+    # ---------- 4. 批量生成 ----------
     res_completions = []
-
     total = len(hendrycks_math_ins)
     bs = batch_size
 
@@ -208,51 +271,44 @@ def test_hendrycks_math(model, data_path, start=0, end=MAX_INT, batch_size=1, te
             )
 
         for out_ids, in_len in zip(outputs, input_lengths):
-            gen_ids = out_ids[in_len:]
+            gen_ids = out_ids[in_len:]  # 截掉 prompt
             text = tokenizer.decode(gen_ids, skip_special_tokens=True)
             res_completions.append(text)
 
-    # -------- 4. 评测：用 extract_answer_expr + util.is_equiv --------
+    # ---------- 5. 评测 ----------
     results = []
-    global invalid_outputs
-    invalid_outputs = []
-
-    for doc, completion, answer in zip(hendrycks_math_ins, res_completions, hendrycks_math_answers):
-        pred_expr = extract_answer_expr(completion)
-        if pred_expr is None:
-            invalid_outputs.append(
-                {"question": doc, "output": completion, "answer": answer}
-            )
-            results.append(False)
-            continue
-
-        pred_expr = remove_boxed(pred_expr)
-        gold_expr = remove_boxed(answer)
-
-        res = util.is_equiv(pred_expr, gold_expr)
-        if not res:
-            invalid_outputs.append(
-                {"question": doc, "output": completion, "answer": answer}
-            )
+    for doc, completion, gold_expr in zip(
+        hendrycks_math_ins, res_completions, hendrycks_math_answers
+    ):
+        res = process_results(doc, completion, gold_expr)
         results.append(res)
 
     acc = sum(results) / len(results) if results else 0.0
     print("len invalid outputs ====", len(invalid_outputs), ", invalid_outputs ===", invalid_outputs)
     print("length====", len(results), ", acc====", acc)
 
+
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default='')  # model path
-    parser.add_argument("--data_file", type=str, default='')  # data path
-    parser.add_argument("--train_file", type=str, required=True,  # 训练集路径
-                        help="GSM8K 训练集 jsonl，用作 few-shot 示例")
-
-    parser.add_argument("--start", type=int, default=0) #start index
-    parser.add_argument("--end", type=int, default=MAX_INT)  # end index
-    parser.add_argument("--batch_size", type=int, default=400)  # batch_size
-    parser.add_argument("--tensor_parallel_size", type=int, default=8)  # tensor_parallel_size
+    parser.add_argument("--model", type=str, default='')   # HF 模型名或本地路径
+    parser.add_argument("--data_file", type=str, default='')   # 测试集
+    parser.add_argument("--train_file", type=str, required=True,  # 训练集 / few-shot 源
+                        help="MATH 训练集 jsonl，用作 few-shot 示例")
+    parser.add_argument("--start", type=int, default=0)
+    parser.add_argument("--end", type=int, default=MAX_INT)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--tensor_parallel_size", type=int, default=1)
     return parser.parse_args()
+
 
 if __name__ == "__main__":
     args = parse_args()
-    test_hendrycks_math(model=args.model, data_path=args.data_file, start=args.start, end=args.end, batch_size=args.batch_size, tensor_parallel_size=args.tensor_parallel_size)
+    test_hendrycks_math(
+        model=args.model,
+        data_path=args.data_file,
+        train_path=args.train_file,
+        start=args.start,
+        end=args.end,
+        batch_size=args.batch_size,
+        tensor_parallel_size=args.tensor_parallel_size,
+    )

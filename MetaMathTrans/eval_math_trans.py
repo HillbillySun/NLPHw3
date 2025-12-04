@@ -58,6 +58,7 @@ def process_results(doc, completion, answer):
         invalid_outputs.append(
             {"question": doc, "output": completion, "answer": answer}
         )
+    # print("PRED:", pred_expr, "GOLD:", gold_expr)
 
     return res
 
@@ -123,15 +124,31 @@ def batch_data(data_list, batch_size=1):
 
 def extract_answer_expr(completion: str):
     """
-    先尝试找 'The answer is:'
-    然后回退到：model 输出里的最后一个 \\boxed{...}
-    再不行，就取最后一行并去掉前缀文字。
+    先尽量从“真正的答案行”里抽:
+        The answer is: <something>
+    - 忽略模板里的 'The answer is: <expression>'
+    - 没有的话，退到最后一个 \\boxed{...}
+    - 再不行，用最后一行兜底
     """
-    # 1) 优先匹配 "The answer is:"
-    m = re.search(r"[Tt]he answer is[:：]?\s*(.*)", completion)
-    if m:
+
+    lines = completion.splitlines()
+
+    # 1) 从“最后一行往前”找含 "The answer is" 的行
+    for line in reversed(lines):
+        m = re.search(r"[Tt]he answer is[:：]?\s*(.*)", line)
+        if not m:
+            continue
+
         expr = m.group(1).strip()
-        expr = expr.split("\n")[0].strip()
+        # ---- 关键过滤：跳过模板那种行 ----
+        # 例如 "The answer is: <expression>"
+        if (
+            not expr  # 空
+            or "<" in expr or ">" in expr  # 含占位符 <>
+            or "expression" in expr.lower()  # 明显是提示词里的字样
+        ):
+            continue
+
         expr = expr.rstrip(".!；;")
         return expr
 
@@ -140,20 +157,20 @@ def extract_answer_expr(completion: str):
         boxed = util.last_boxed_only_string(completion)
     except Exception:
         boxed = None
-    if boxed is not None:
-        # "\\boxed{...}" -> "..."
-        expr = remove_boxed(boxed)
-        if expr is not None:
-            expr = expr.strip()
-            expr = expr.rstrip(".!；;")
-            return expr
 
-    # 3) 再兜底：拿最后一行非空内容，去掉常见前缀词
-    lines = [l.strip() for l in completion.splitlines() if l.strip()]
-    if not lines:
+    if boxed is not None:
+        expr = remove_boxed(boxed)  # "\\boxed{...}" -> "..."
+        if expr is not None:
+            expr = expr.strip().rstrip(".!；;")
+            if expr:
+                return expr
+
+    # 3) 再兜底：拿最后一行非空内容，去掉常见前缀
+    non_empty = [l.strip() for l in lines if l.strip()]
+    if not non_empty:
         return None
-    expr = lines[-1]
-    # 去掉形如 "Answer:", "Final answer:", "The final answer is:" 这些自然语言前缀
+
+    expr = non_empty[-1]
     expr = re.sub(
         r"^(Answer|So|Thus|Therefore|Final answer|The final answer is)[:：]?\s*",
         "",
@@ -162,7 +179,6 @@ def extract_answer_expr(completion: str):
     )
     expr = expr.rstrip(".!；;")
     return expr or None
-
 
 def test_hendrycks_math(model, data_path, start=0, end=MAX_INT, batch_size=1, tensor_parallel_size=1):
     hendrycks_math_ins = []
@@ -273,7 +289,8 @@ def test_hendrycks_math(model, data_path, start=0, end=MAX_INT, batch_size=1, te
         results.append(res)
 
     acc = sum(results) / len(results)
-    print('len invalid outputs ====', len(invalid_outputs), ', valid_outputs===', invalid_outputs)
+    # print('len invalid outputs ====', len(invalid_outputs), ', invalid_outputs===', invalid_outputs)
+    print('len invalid outputs ====', len(invalid_outputs))
     print('start===', start, ', end====',end)
     print('length====', len(results), ', acc====', acc)
 
